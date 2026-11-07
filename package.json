@@ -1,0 +1,12 @@
+{
+	"name": "pi-cache-keepalive",
+	"version": "1.0.0",
+	"description": "Keep a pi session's provider prompt cache warm between turns: replays the session's own captured payload with max_tokens 1 at a fraction of the TTL, and spends nothing when the prefix changed",
+	"keywords": ["pi-package", "pi", "cache", "prompt-cache", "anthropic", "cost"],
+	"license": "MIT",
+	"type": "module",
+	"files": ["index.ts", "README.md", "CHANGELOG.md", "LICENSE"],
+	"pi": { "extensions": ["./index.ts"] },
+	"peerDependencies": { "@earendil-works/pi-coding-agent": "*" },
+	"engines": { "node": ">=22.19.0" }
+}
