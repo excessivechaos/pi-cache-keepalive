@@ -103,6 +103,7 @@ import { appendFileSync, existsSync, readFileSync, renameSync, statSync } from "
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 
 export const CONFIG_DIR_ENV = "PI_CODING_AGENT_DIR";
 /** Agent dir, honouring the same override pi itself uses. */
@@ -585,6 +586,39 @@ export function formatStatus(
 	}
 	if (count === 0) lines.push("No model has served yet.");
 	return lines;
+}
+
+/** `$0.013656` -> `$0.013656`; trailing zeros trimmed the way pi's own warm line trims them. */
+function usd(value: number): string {
+	return `$${value.toFixed(6).replace(/(\.\d{3}\d*?)0+$/, "$1")}`;
+}
+
+/**
+ * One transcript line per warm, in the same shape as pi's own `Cache warmed: $<cost>`.
+ * `warmCount` is shown as `n/N` when the count policy owns the cap.
+ */
+export function formatWarmNotice(data: Record<string, unknown>): string {
+	const cost = Number(data.costUsd ?? 0);
+	const tokens = Number(data.promptTokens ?? 0);
+	const warms = Number(data.warmsThisGap ?? 0);
+	const wrote = Number(data.cacheWrite ?? 0);
+	const parts = [`${tokens.toLocaleString("en-US")} tokens`];
+	if (warms > 0) parts.push(`warm ${warms}`);
+	// A warm that wrote cache is a design failure; make it impossible to miss in the transcript.
+	if (wrote > 0) parts.push(`WROTE ${wrote.toLocaleString("en-US")}`);
+	return `Cache warmed: ${usd(cost)} · ${parts.join(" · ")}`;
+}
+
+/** The expanded body: what the warm avoided and where it came from. */
+export function formatWarmDetails(data: Record<string, unknown>): string {
+	const derived = (data.derived ?? {}) as Record<string, unknown>;
+	const window = (data.window ?? {}) as Record<string, unknown>;
+	const lines = [
+		`model ${String(data.provider ?? "?")}/${String(data.model ?? "?")}`,
+		`cold start ${usd(Number(derived.coldStartUsd ?? 0))} would have been billed`,
+		`payload ${String(data.payloadSha ?? "?").slice(0, 12)} · window ${String(window.before ?? "?")} -> ${String(window.after ?? "?")}`,
+	];
+	return lines.join("\n");
 }
 
 /** The runtime state the gate reads. Split out so the rule can be tested without a session. */
@@ -1128,6 +1162,16 @@ export default function cacheKeepalive(
 			logLine(`capture-error error=${error instanceof Error ? error.message : String(error)}`);
 		}
 		return event.payload;
+	});
+
+	// Equal to pi's built-in warm line: a dim one-liner in the transcript, with the cost. Without a
+	// renderer the audit entry stays invisible, which made a warm indistinguishable from a bust.
+	pi.registerEntryRenderer<Record<string, unknown>>("cache-keepalive", (entry, options, theme) => {
+		const data = (entry.data ?? {}) as Record<string, unknown>;
+		const text = options.expanded
+			? `${formatWarmNotice(data)}\n${formatWarmDetails(data)}`
+			: formatWarmNotice(data);
+		return new Text(theme.fg("dim", text), 1, 0);
 	});
 
 	pi.registerCommand("cache-keepalive", {

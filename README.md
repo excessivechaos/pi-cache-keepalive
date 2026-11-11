@@ -46,6 +46,19 @@ A streaming request still refuses, so a warm never interleaves with the session'
 capture is also dropped if the conversation was rewritten, and the budget caps a gap at
 `maxWarmCostFraction` of one cold start whatever the wait looks like.
 
+## Where you see it
+
+Every successful warm appends one dim line to the transcript, the same shape pi's own warmer uses:
+
+```
+Cache warmed: $0.013656 · 68,141 tokens · warm 3
+```
+
+Expanded (Ctrl+O) it adds the model, the cold start it avoided, and the payload sha. A warm that
+ever reports `cacheWrite > 0` — the one outcome the design forbids — prints `WROTE <n>` on that line
+instead of hiding in the log. The line comes from a renderer on the extension's existing audit entry,
+so `cache-keepalive` entries stay out of the LLM context and out of `/session` cost totals.
+
 ## Guards
 
 Every one of these is checked before a send, and each refuses rather than guesses:

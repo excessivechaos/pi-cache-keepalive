@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.3.0
+
+- **Warms are visible.** `pi.registerEntryRenderer("cache-keepalive", ...)` draws the audit entry that
+  was already being written: `Cache warmed: $0.013656 · 68,141 tokens · warm 3`, dim, one line per
+  warm, expanded to show the model, the cold start avoided and the payload sha. A warm that writes
+  cache prints `WROTE <n>` on the line. Before this the entry was invisible, so a warm and a bust
+  looked the same from the transcript.
+- `@earendil-works/pi-tui` is a peer dependency (as in pi-quota-statusline) for the `Text` component.
+- The test harness resolves the newest installed pi release instead of pinning 1.5.1.
+
 ## 1.2.0
 
 - **`warmCount`**: a hard cap on keepalives per gap. The priced policy (`maxWarmCostFraction`) allows

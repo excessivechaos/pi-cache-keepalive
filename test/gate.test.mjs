@@ -1,10 +1,22 @@
 import assert from "node:assert/strict";
 
-const PI_DIR = process.env.PI_PI_DIR ?? "/home/qualidiv/.pi/agent/install/releases/1.5.1";
+import { readdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+/** PI_PI_DIR wins; otherwise the newest installed release, so an update does not strand the tests. */
+function piDir() {
+  if (process.env.PI_PI_DIR) return process.env.PI_PI_DIR;
+  const base = join(homedir(), ".pi", "agent", "install", "releases");
+  const versions = readdirSync(base).filter((v) => /^\d+\.\d+\.\d+$/.test(v));
+  versions.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  return join(base, versions.at(-1));
+}
+const PI_DIR = piDir();
 const { createJiti } = await import(`${PI_DIR}/node_modules/jiti/lib/jiti.mjs`);
 const j = createJiti(import.meta.url, { interopDefault: true, moduleCache: false, alias: {
   "@earendil-works/pi-coding-agent": `${PI_DIR}/node_modules/@earendil-works/pi-coding-agent/dist/index.js`,
   "@earendil-works/pi-ai": `${PI_DIR}/node_modules/@earendil-works/pi-ai/dist/index.js`,
+  "@earendil-works/pi-tui": `${PI_DIR}/node_modules/@earendil-works/pi-tui/dist/index.js`,
   typebox: `${PI_DIR}/node_modules/typebox/build/index.mjs` } });
 const m = await j.import(new URL("../index.ts", import.meta.url).pathname);
 
@@ -63,5 +75,18 @@ eq(m.parseConfig({ warmCount: 9 }).warmCount, 9, "warmCount parses");
 eq(m.parseConfig({ warmCount: 9.7 }).warmCount, 9, "warmCount floors");
 eq(m.parseConfig({ warmCount: 0 }).warmCount, undefined, "warmCount 0 is ignored");
 eq(m.parseConfig({}).warmCount, undefined, "absent warmCount keeps the priced policy");
+
+
+// ---- the transcript line ------------------------------------------------------------------------
+const WARM = { costUsd: 0.013656, promptTokens: 68141, warmsThisGap: 3, cacheWrite: 0,
+  provider: "anthropic", model: "claude-opus-5-5", payloadSha: "dbd30317349a385f",
+  derived: { coldStartUsd: 0.540705, warmUsd: 0.013656 }, window: { before: 41.2, after: 41.4 } };
+eq(m.formatWarmNotice(WARM), "Cache warmed: $0.013656 · 68,141 tokens · warm 3", "line matches pi's shape and adds the count");
+eq(m.formatWarmNotice({ ...WARM, cacheWrite: 900 }), "Cache warmed: $0.013656 · 68,141 tokens · warm 3 · WROTE 900", "a write is impossible to miss");
+eq(m.formatWarmNotice({ ...WARM, costUsd: 0.000076 }).startsWith("Cache warmed: $0.000076"), true, "six decimals kept, trailing zeros trimmed");
+eq(m.formatWarmNotice({ ...WARM, costUsd: 0.005 }).includes("$0.005"), true, "short costs stay short");
+eq(m.formatWarmNotice({}).startsWith("Cache warmed: $0"), true, "an old entry without fields does not throw");
+eq(m.formatWarmDetails(WARM).includes("cold start $0.540705"), true, "expanded body names what the warm avoided");
+eq(m.formatWarmDetails(WARM).split("\n").length, 3, "expanded body is three lines");
 
 console.log(`ok ${checks} checks`);
