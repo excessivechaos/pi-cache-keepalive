@@ -12,8 +12,9 @@
  *  1. On `before_provider_request` it stores, per `provider|model`, the complete outgoing
  *     payload as a JSON string, its sha256, the timestamp, and the cache TTL taken from
  *     the payload's own `cache_control` markers.
- *  2. A 60 s ticker, idle for at least 10 s with no agent run and no request in flight,
- *     replays that payload with `max_tokens: 1` through `ctx.modelRegistry.streamSimple`,
+ *  2. A 60 s ticker, quiet for at least 10 s with no request of the session's own
+ *     streaming, replays that payload with `max_tokens: 1` through
+ *     `ctx.modelRegistry.streamSimple`,
  *     the provider transport a real request uses. `onPayload` returns the captured bytes
  *     and the Anthropic OAuth wrapper shapes them last, so the wire request is exactly
  *     `shape(capture)` — the same prefix the real request cached. Raw
@@ -86,10 +87,16 @@
  *        `PI_CACHE_KEEPALIVE_LOG` for test isolation)
  * Audit: one `custom` session entry per warm, `customType: "cache-keepalive"`.
  *
- * Note on pi's built-in warmer: with `cacheWarming: "idle"` in settings.json, pi also
- * warms the model of the current run (not the earlier ones) for 30 minutes. That path is
- * left untouched here; when it is active for a model this extension's budget does not see
- * its spend. Turn it off when this extension owns warming.
+ * While a run is open but not streaming — a long tool, or `ask_user_question` waiting for
+ * the user — the run is *blocked*, and that is the warm this extension was missing: `busy`
+ * used to hold it dark for the whole wait, which is exactly the gap that outlives the TTL.
+ * A blocked run is allowed (see `warmGate`); a streaming one is not, and neither is a
+ * compaction.
+ *
+ * Note on pi's built-in warmer: it stops 60 minutes after the request that started it and
+ * has no spend cap, so it covers one refresh and gives up. This extension is the one to run
+ * when a wait can outlive that hour. Set `cacheWarming: "off"` so the two do not both warm
+ * the same entry five minutes apart.
  */
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, readFileSync, renameSync, statSync } from "node:fs";
@@ -569,6 +576,36 @@ export function formatStatus(
 	return lines;
 }
 
+/** The runtime state the gate reads. Split out so the rule can be tested without a session. */
+export interface WarmGateState {
+	/** A keepalive of our own is being sent. */
+	inflight: boolean;
+	/** The agent run is open (between `agent_start` and `agent_settled`). */
+	busy: boolean;
+	/** A provider request of the session's own is streaming. */
+	streaming: boolean;
+	/** `ctx.isIdle()`: no run, no compaction. */
+	idle: boolean;
+}
+
+/**
+ * Why a warm must not be sent right now, or undefined when it may.
+ *
+ * A run that is open but not streaming is *blocked*: on a tool, or on a question waiting for the
+ * user. That is the gap this extension exists to cover — `busy` alone kept it dark for the whole
+ * wait, which is where the cache was repeatedly lost. Nothing writes to the conversation while a
+ * request is not streaming, so replaying the captured prefix is safe and lands as a cache read.
+ *
+ * Two states still refuse: a request of the session's own mid-stream, and a compaction (which is
+ * neither a run nor idle).
+ */
+export function warmGate(state: WarmGateState): string | undefined {
+	if (state.inflight) return "warm-inflight";
+	if (state.streaming) return "request-streaming";
+	if (!state.idle && !state.busy) return "compacting";
+	return undefined;
+}
+
 /** Test seams; the warm path itself always uses the real `ctx.modelRegistry.streamSimple`. */
 export interface CacheKeepaliveDeps {
 	/** Overrides the provider-window readers; tests use it to make `observed` deterministic. */
@@ -597,6 +634,8 @@ export default function cacheKeepalive(
 	let ticker: ReturnType<typeof setInterval> | undefined;
 	let busy = false;
 	let inflight = false;
+	/** A request of the session's own is streaming; false while a tool or a question holds the run. */
+	let streaming = false;
 	let lastActivityAt = Date.now();
 	let closed = false;
 	let errors = 0;
@@ -707,7 +746,7 @@ export default function cacheKeepalive(
 	/** One model's turn: honour the busy/quiet gates, then send or record why not. */
 	async function runTrack(track: ModelTrack): Promise<void> {
 		if (!active() || ctx === undefined || track.payloadJson === undefined) return;
-		if (inflight || busy || !ctx.isIdle()) return; // agent_settled reschedules
+		if (warmGate({ inflight, busy, streaming, idle: ctx.isIdle() }) !== undefined) return;
 		const quietAt = lastActivityAt + QUIET_MS;
 		if (Date.now() < quietAt) {
 			schedule(track, quietAt + 25);
@@ -737,8 +776,8 @@ export default function cacheKeepalive(
 	}
 
 	async function warm(track: ModelTrack): Promise<void> {
-		if (!active() || inflight || ctx === undefined) return;
-		if (busy || !ctx.isIdle()) return;
+		if (!active() || ctx === undefined) return;
+		if (warmGate({ inflight, busy, streaming, idle: ctx.isIdle() }) !== undefined) return;
 		const decision = decideWarm(track, Date.now(), config);
 		if (!decision.warm) return;
 		if (track.payloadJson === undefined || track.provider === undefined) return;
@@ -917,8 +956,8 @@ export default function cacheKeepalive(
 	}
 
 	async function tick(): Promise<void> {
-		if (!active() || inflight || ctx === undefined) return;
-		if (busy || !ctx.isIdle()) return;
+		if (!active() || ctx === undefined) return;
+		if (warmGate({ inflight, busy, streaming, idle: ctx.isIdle() }) !== undefined) return;
 		if (Date.now() - lastActivityAt < QUIET_MS) return;
 		const now = Date.now();
 		for (const track of tracks.values()) {
@@ -978,6 +1017,7 @@ export default function cacheKeepalive(
 
 	pi.on("agent_settled", async () => {
 		busy = false;
+		streaming = false;
 		lastActivityAt = Date.now();
 		// The agent was the reason a warm was deferred; re-arm every live model.
 		for (const track of tracks.values()) {
@@ -988,12 +1028,17 @@ export default function cacheKeepalive(
 	});
 
 	pi.on("message_end", async (event) => {
-		learnFromMessage(event.message as { role?: string; provider?: unknown; model?: unknown });
+		const message = event.message as { role?: string; provider?: unknown; model?: unknown };
+		// The assistant message ends the response the request was streaming. The tool calls in it
+		// are what holds the run next, and a warm is allowed while they run.
+		if (message.role === "assistant") streaming = false;
+		learnFromMessage(message);
 	});
 
 	pi.on("before_provider_request", async (event, context) => {
 		try {
 			lastActivityAt = Date.now();
+			streaming = true;
 			if (!active()) return event.payload;
 			const payload = event.payload;
 			if (!isRecord(payload) || typeof payload.model !== "string") return event.payload;

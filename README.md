@@ -24,12 +24,30 @@ replays the capture through pi's provider transport (`ctx.modelRegistry.streamSi
 `onPayload` returning the capture) so any provider shaping — OAuth billing headers, for example —
 is applied exactly as it was for the original request.
 
+It warms **while a run is blocked**. A run that is open but not streaming — a long tool, or
+`ask_user_question` waiting for an answer — used to be excluded by the `busy` flag, which is the
+one situation where a gap actually outlives the TTL. A blocked run is now allowed, keepalives
+included, up to the budget:
+
+```
+wait        warms (1h TTL, 250k opus)      spend      without
+ 62 min     1 at 51 min                     $0.049     $1.98 cold write
+  3 h       3 at 51/102/153 min             $0.15      $1.98
+  9 h       10, budget reached              $0.49      $1.98
+abandoned   10, budget reached              $0.49      $1.98
+```
+
+A streaming request still refuses, so a warm never interleaves with the session's own response; the
+capture is also dropped if the conversation was rewritten, and the budget caps a gap at
+`maxWarmCostFraction` of one cold start whatever the wait looks like.
+
 ## Guards
 
 Every one of these is checked before a send, and each refuses rather than guesses:
 
 | guard | effect |
 |---|---|
+| `gate` | warms when idle, or when a run is **blocked** (open but not streaming) — never while the session's own request streams, never during a compaction, never twice at once |
 | `alive` | warms only while the entry is still within `ttl × 0.95`; a missed window marks the model `expired` for the rest of the gap and it is never warmed again — a warm after expiry would re-write the prefix |
 | `unchanged` | a `compaction`, `context_edit` or `branch_summary` entry after the capture drops it (`skipped:rewritten`); plain message appends are allowed because they extend the prefix |
 | prompt resize | a materially different prompt size resets the gap (`prompt-resized`) |
