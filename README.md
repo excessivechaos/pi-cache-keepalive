@@ -30,12 +30,17 @@ one situation where a gap actually outlives the TTL. A blocked run is now allowe
 included, up to the budget:
 
 ```
-wait        warms (1h TTL, 250k opus)      spend      without
- 62 min     1 at 51 min                     $0.049     $1.98 cold write
-  3 h       3 at 51/102/153 min             $0.15      $1.98
-  9 h       10, budget reached              $0.49      $1.98
-abandoned   10, budget reached              $0.49      $1.98
+wait        warms (warmCount 9, 250k opus)  spend      without
+ 62 min     1 at 51 min                      $0.049     $1.98 cold write
+  3 h       3 at 51/102/153 min              $0.15      $1.98
+  8 h       9 at 51…459 min                  $0.44      $1.98
+overnight   9, count reached                 $0.44      $1.98
 ```
+
+`warmCount` (this workstation sets 9) is a count cap that replaces the priced one. The priced
+policy allows only six on the Anthropic read/write ratio — `0.25 ÷ (0.2 ÷ 5) = 6.25` — whatever the
+prompt size, because both sides scale together. A count says what it means; a warm is still a cache
+read, so nine of them cost nine reads (`$0.049` each at 250k) and never a write.
 
 A streaming request still refuses, so a warm never interleaves with the session's own response; the
 capture is also dropped if the conversation was rewritten, and the budget caps a gap at
@@ -51,7 +56,7 @@ Every one of these is checked before a send, and each refuses rather than guesse
 | `alive` | warms only while the entry is still within `ttl × 0.95`; a missed window marks the model `expired` for the rest of the gap and it is never warmed again — a warm after expiry would re-write the prefix |
 | `unchanged` | a `compaction`, `context_edit` or `branch_summary` entry after the capture drops it (`skipped:rewritten`); plain message appends are allowed because they extend the prefix |
 | prompt resize | a materially different prompt size resets the gap (`prompt-resized`) |
-| budget | stops at `maxWarmCostFraction` (default 0.25) of one cold start per idle gap, computed from API rates; `warmsAllowed` is derived from those prices, not configured |
+| budget | either `warmCount` warms per gap, or — when that is unset — `maxWarmCostFraction` (default 0.25) of one cold start, computed from API rates. Whichever is configured gates; they are not both applied |
 | belt | if a warm's own usage reports `cacheWrite > 0`, it is logged as `warm-wrote-cache`, not counted as a success, and the gap stops |
 | wire | `anthropic-messages` only; other wires are tracked but never sent |
 
@@ -66,10 +71,14 @@ Nothing is written to the transcript except one `cache-keepalive` audit entry pe
 {
   "enabled": true,
   "warmAtFraction": 0.85,
+  "warmCount": 9,
   "maxWarmCostFraction": 0.25,
   "models": ["anthropic/claude-opus-5-5", "anthropic/claude-sonnet-5-5", "anthropic/claude-haiku-5-5"],
   "maxIdleHours": 8
 }
+
+`warmCount` is optional. Set it when the number of hours of cover is the thing you care about
+(9 warms ≈ 7.6 h at a 1 h TTL); leave it out to let the priced fraction decide.
 ```
 
 `models` is an allowlist of `provider/modelId`; empty means every eligible model. With a list, any

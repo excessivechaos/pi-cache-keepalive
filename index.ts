@@ -125,6 +125,12 @@ export interface CacheKeepaliveConfig {
 	enabled: boolean;
 	warmAtFraction: number;
 	maxWarmCostFraction: number;
+	/**
+	 * Hard cap on keepalives per gap. When set it owns the cap and `maxWarmCostFraction` is inert:
+	 * the priced fraction allows only six on the Anthropic read/write ratio (0.25 ÷ (0.2 ÷ 5)),
+	 * so asking for nine warms needs a count, not a budget. Unset keeps the priced policy.
+	 */
+	warmCount?: number;
 	models: string[];
 	maxIdleHours: number;
 }
@@ -135,6 +141,7 @@ export const FALLBACK_WARMS_PER_GAP = 6;
 export const DEFAULT_CONFIG: CacheKeepaliveConfig = {
 	enabled: true,
 	warmAtFraction: 0.85,
+	warmCount: undefined,
 	maxWarmCostFraction: 0.25,
 	models: [],
 	maxIdleHours: 8,
@@ -158,6 +165,7 @@ export function parseConfig(raw: unknown): CacheKeepaliveConfig {
 	const root = isRecord(raw) ? raw : {};
 	const fraction = finite(root.warmAtFraction);
 	const costFraction = finite(root.maxWarmCostFraction);
+	const warms = finite(root.warmCount);
 	const idle = finite(root.maxIdleHours);
 	return {
 		enabled: typeof root.enabled === "boolean" ? root.enabled : DEFAULT_CONFIG.enabled,
@@ -165,6 +173,7 @@ export function parseConfig(raw: unknown): CacheKeepaliveConfig {
 		warmAtFraction: fraction === undefined ? DEFAULT_CONFIG.warmAtFraction : Math.min(1, Math.max(0.1, fraction)),
 		maxWarmCostFraction:
 			costFraction === undefined || costFraction < 0 ? DEFAULT_CONFIG.maxWarmCostFraction : costFraction,
+		warmCount: warms === undefined || warms < 1 ? undefined : Math.floor(warms),
 		models: Array.isArray(root.models) ? root.models.filter((entry): entry is string => typeof entry === "string") : [],
 		maxIdleHours: idle === undefined || idle <= 0 ? DEFAULT_CONFIG.maxIdleHours : idle,
 	};
@@ -385,7 +394,9 @@ export function decideWarm(track: ModelTrack, now: number, config: CacheKeepaliv
 	if (now - track.lastConfirmedAt >= track.ttlMs * 0.95) return { warm: false, reason: "expired" };
 	if (!track.priceMetadata) {
 		// No usable prices: the priced policy cannot run, so a count backstop applies.
-		if (track.warmsThisGap >= FALLBACK_WARMS_PER_GAP) return { warm: false, reason: "count-fallback" };
+		if (track.warmsThisGap >= (config.warmCount ?? FALLBACK_WARMS_PER_GAP)) {
+			return { warm: false, reason: "count-fallback" };
+		}
 	} else if (
 		(track.warmsAllowed !== undefined && track.warmsThisGap >= track.warmsAllowed) ||
 		(track.budgetUsd > 0 && track.warmCostUsd >= track.budgetUsd)
@@ -539,7 +550,7 @@ export function formatStatus(
 	windows: Map<string, WindowReading>,
 ): string[] {
 	const lines = [
-		`Cache keepalive: ${mode}${config.enabled ? "" : " (config enabled=false)"} · warm at ${config.warmAtFraction}×TTL · cost budget ${config.maxWarmCostFraction}× cold start/gap · idle limit ${config.maxIdleHours}h`,
+		`Cache keepalive: ${mode}${config.enabled ? "" : " (config enabled=false)"} · warm at ${config.warmAtFraction}×TTL · ${config.warmCount === undefined ? `cost budget ${config.maxWarmCostFraction}× cold start/gap` : `${config.warmCount} warms/gap (count cap)`} · idle limit ${config.maxIdleHours}h`,
 	];
 	const windowText = [...windows.entries()]
 		.map(([provider, reading]) => `${provider} ${reading.percent === undefined ? `unknown (${reading.error ?? "?"})` : `${reading.percent.toFixed(2)}%`}`)
@@ -550,7 +561,7 @@ export function formatStatus(
 		count += 1;
 		const name = `${track.provider ?? "?"}/${track.modelId}`;
 		const spent = track.budgetUsd > 0 && track.warmCostUsd >= track.budgetUsd;
-		const capped = !track.priceMetadata && track.warmsThisGap >= FALLBACK_WARMS_PER_GAP;
+		const capped = !track.priceMetadata && track.warmsThisGap >= (config.warmCount ?? FALLBACK_WARMS_PER_GAP);
 		const next =
 			track.wire !== "anthropic-messages" || track.closedGap || track.provider === undefined
 				? "—"
@@ -567,7 +578,7 @@ export function formatStatus(
 			? `spend $${track.warmCostUsd.toFixed(6)} of budget $${track.budgetUsd.toFixed(6)} (API rates, gating) · warmsAllowed ${track.warmsAllowed ?? "pending"} (derived)`
 			: track.warmsThisGap === 0
 				? "budget: pending first warm (price metadata derives on the first keepalive)"
-				: `budget: count fallback (no price metadata) · warms ${track.warmsThisGap}/${FALLBACK_WARMS_PER_GAP}`;
+				: `budget: count fallback (no price metadata) · warms ${track.warmsThisGap}/${config.warmCount ?? FALLBACK_WARMS_PER_GAP}`;
 		lines.push(
 			`${name} · ${track.wire === "anthropic-messages" ? "anthropic" : "unsupported"} · last real ${ago(now, track.lastRequestAt)} · warms ${track.warmsThisGap} · next warm ${next} · last: ${track.lastResult ?? "none"} · ${budgetText} · warm $${track.warmUnitCostUsd.toFixed(6)} (derived) · cold start $${track.coldStartUsd.toFixed(6)} × ${track.coldStartsAvoided} avoided · saved $${track.avoidedUsd.toFixed(6)} · window Δ observed: ${track.observedPercent.toFixed(2)}%${track.lastDelta === undefined ? "" : ` (last ${typeof track.lastDelta === "number" ? `${track.lastDelta.toFixed(2)}%` : track.lastDelta})`} (not gating)${track.skip === undefined ? "" : ` · ${track.skip}`}${track.payloadSha === undefined ? "" : ` · sha ${shortSha(track.payloadSha)}`}`,
 		);
@@ -849,11 +860,15 @@ export default function cacheKeepalive(
 			track.promptTokens = promptTokens;
 			track.warmUnitCostUsd = derivedWarm;
 			track.coldStartUsd = derivedCold;
-			track.budgetUsd = warmBudgetUsd(derivedCold, config.maxWarmCostFraction);
+			// A configured count owns the cap; the spend budget is then unused (zero), because N
+			// warms cost exactly N × warm and the count already bounds the spend.
+			track.budgetUsd =
+				config.warmCount === undefined ? warmBudgetUsd(derivedCold, config.maxWarmCostFraction) : 0;
 			track.warmsAllowed =
-				hasPrices && derivedWarm > 0 && derivedCold > 0
+				config.warmCount ??
+				(hasPrices && derivedWarm > 0 && derivedCold > 0
 					? Math.floor(config.maxWarmCostFraction / (derivedWarm / derivedCold))
-					: undefined;
+					: undefined);
 			track.warmCostUsd += usage.cost.total;
 			if (track.warmsThisGap === 1) {
 				track.coldStartsAvoided += 1;

@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.0
+
+- **`warmCount`**: a hard cap on keepalives per gap. The priced policy (`maxWarmCostFraction`) allows
+  six on the Anthropic read/write ratio whatever the prompt size, because the warm and the cold start
+  scale together; a count is what "nine warms" needs. When `warmCount` is set it owns the cap and the
+  spend budget is unused. It also replaces the six-warm backstop used when a model reports no prices.
+- Unit tests cover the count at the boundary (8 warms warm, 9 refuse), the metadata-free path, and
+  config parsing.
+
 ## 1.1.0
 
 - **Warms while a run is blocked.** The gate used to require an idle agent (`busy || !ctx.isIdle()`),

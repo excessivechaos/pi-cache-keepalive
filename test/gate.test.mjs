@@ -33,4 +33,35 @@ eq(/inflight \|\| busy \|\| !ctx\.isIdle\(\)/.test(src), false, "no call site st
 eq(/if \(busy \|\| !ctx\.isIdle\(\)\) return;/.test(src), false, "no call site still refuses a blocked run (warm/tick)");
 eq(src.split("warmGate({").length - 1, 3, "all three gates go through warmGate");
 
+
+// ---- warmCount: a count owns the cap when it is set ----------------------------------------------
+const CFG = (o = {}) => ({ ...m.DEFAULT_CONFIG, ...o });
+const track = (o = {}) => ({
+  key: "anthropic/claude-opus-5-5", modelId: "claude-opus-5-5", provider: "anthropic",
+  wire: "anthropic-messages", payloadJson: "{}", payloadSha: "x", renderSha: "x",
+  lastRequestAt: 1000, lastConfirmedAt: 1000, ttlMs: 3_600_000, priceMetadata: true,
+  warmsThisGap: 0, warmsAllowed: 9, budgetUsd: 0, warmCostUsd: 0,
+  nextWarmAllowedAt: 0, expired: false, rewritten: false, closedGap: false,
+  ...o,
+});
+const at = 1000 + 51 * 60_000;          // 51 minutes after the capture: due
+const dec = (o = {}, cfg = {}) => m.decideWarm(track(o), at, CFG(cfg));
+
+eq(dec({ warmsThisGap: 8 }).warm, true, "the ninth warm is allowed under warmCount 9");
+eq(dec({ warmsThisGap: 9 }).reason, "cost-budget", "the tenth is refused");
+eq(dec({ warmsThisGap: 9 }, { warmCount: 9 }).reason, "cost-budget", "count 9 caps at 9");
+eq(dec({ warmsThisGap: 8 }, { warmCount: 9 }).warm, true, "count 9 allows 8");
+eq(dec({ warmsThisGap: 9, warmsAllowed: 12 }, { warmCount: 12 }).warm, true, "count 12 allows 9");
+
+// without price metadata the configured count replaces the six-warm backstop
+eq(dec({ priceMetadata: false, warmsThisGap: 8 }, { warmCount: 9 }).warm, true, "count 9 beats the old fallback of 6");
+eq(dec({ priceMetadata: false, warmsThisGap: 9 }, { warmCount: 9 }).reason, "count-fallback", "count 9 stops at 9");
+eq(dec({ priceMetadata: false, warmsThisGap: 6 }).reason, "count-fallback", "no warmCount keeps the fallback of 6");
+
+// config parsing
+eq(m.parseConfig({ warmCount: 9 }).warmCount, 9, "warmCount parses");
+eq(m.parseConfig({ warmCount: 9.7 }).warmCount, 9, "warmCount floors");
+eq(m.parseConfig({ warmCount: 0 }).warmCount, undefined, "warmCount 0 is ignored");
+eq(m.parseConfig({}).warmCount, undefined, "absent warmCount keeps the priced policy");
+
 console.log(`ok ${checks} checks`);
